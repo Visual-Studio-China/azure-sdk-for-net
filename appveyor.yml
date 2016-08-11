@@ -1,7 +1,3 @@
-environment:
-  my_variable:
-    secure: JWSy9tPo2eoTYpPQplvokf4IiVk6onNBbWwAs6nNWWyQ2JaO+MRAg/QzbJnTjpUm
-
 before_build_script:
   - @powershell -NoProfile -ExecutionPolicy unrestricted -Command "&{$Branch='dev';iex ((new-object net.webclient).DownloadString('https://raw.githubusercontent.com/aspnet/Home/dev/dnvminstall.ps1'))}"
   - dnvm install 1.0.0-rc1-final
@@ -17,7 +13,6 @@ build_script:
 
 on_success:
   - git config --global credential.helper store
-  - ps: Add-Content "$env:USERPROFILE\.git-credentials" "https://$($env:access_token):x-oauth-basic@github.com`n"
   - git config --global user.email "vscopbld@microsoft.com"
   - git config --global user.name "OpenPublishBuild"
   - git commit -m "CI Updates"
