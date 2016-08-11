@@ -12,7 +12,7 @@ build_script:
   - cd ..
   - if exist azure-docs-sdk-dotnet rmdir /s /q azure-docs-sdk-dotnet
   - git clone -q --branch=master git@github.com:Azure/azure-docs-sdk-dotnet.git
-  - cd azure-docs-sdk-dotnet
+  - cd azure-sdk-dotnet-lhfba
   - docfx metadata
 
 on_success:
