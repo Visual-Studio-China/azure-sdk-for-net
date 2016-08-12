@@ -15,7 +15,7 @@ before_build:
   - git config --global user.email "vscopbld@microsoft.com"
   - git config --global user.name "OpenPublishBuild"
   - git clone -q --branch=master https://github.com/Azure/azure-docs-sdk-dotnet.git
-  - cd azure-sdk-dotnet
+  - cd azure-docs-sdk-dotnet
   
 build_script:
   - docfx metadata
