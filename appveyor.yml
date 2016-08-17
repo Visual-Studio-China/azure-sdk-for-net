@@ -1,4 +1,5 @@
 clone_folder: c:\projects\azure-sdk-for-net
+clone_depth: 1
 
 environment:
   access_token:
@@ -14,13 +15,14 @@ before_build:
   - ps: Add-Content "$env:USERPROFILE\.git-credentials" "https://$($env:access_token):x-oauth-basic@github.com`n"
   - git config --global user.email "vscopbld@microsoft.com"
   - git config --global user.name "OpenPublishBuild"
-  - git clone -q --branch=master https://github.com/Azure/azure-docs-sdk-dotnet.git
+  - git clone -q --depth=1 --branch=master https://github.com/Azure/azure-docs-sdk-dotnet.git
   - cd azure-docs-sdk-dotnet
   
 build_script:
   - docfx metadata
 
 on_success:
-  - git add .
-  - git commit -m "CI Updates"
+  - git add -A
+  - git diff --quiet --exit-code --cached || git commit -m "Update Reference Content"
   - git push origin master
+  - appveyor AddMessage "Document Updated"
