@@ -26,6 +26,11 @@ using System.Threading.Tasks;
 namespace Microsoft.Azure.Management.DataLake.StoreUploader
 {
     /// <summary>
+    /// Represents a delegate that is called in the event of a thread uploading a file terminating unexpectedly.
+    /// </summary>
+    public delegate void FileUploadThreadFailProgressUpdate(UploadMetadata failedFile);
+
+    /// <summary>
     /// Represents a general purpose file uploader into DataLake. Supports the efficient upload of large files.
     /// </summary>
     public sealed class DataLakeStoreUploader
@@ -46,6 +51,12 @@ namespace Microsoft.Azure.Management.DataLake.StoreUploader
         private bool isDirectory = false;
 
         #endregion
+
+        /// <summary>
+        ///  An event that is registered to progress tracking to ensure that, in the event of an unexpected upload failure,
+        ///  progress is properly updated.
+        /// </summary>
+        public event FileUploadThreadFailProgressUpdate OnFileUploadThreadFailProgressUpdate;
 
         #region Constructor
 
@@ -163,59 +174,209 @@ namespace Microsoft.Azure.Management.DataLake.StoreUploader
                     };
                     try
                     {
-                        var fileProgressTracker = CreateFileProgressTracker(metadata);
+                        Thread progressThread;
+                        var fileProgressTracker = CreateFileProgressTracker(metadata, out progressThread);
                         var exceptions = new ConcurrentQueue<Exception>();
-                        Parallel.ForEach(metadata.Files, folderOptions,
-                            file =>
+                        var allFiles = new ConcurrentQueue<UploadMetadata>(metadata.Files);
+                        int threadCount = Math.Min(allFiles.Count, this.Parameters.ConcurrentFileCount);
+
+                        var executionThreads = new List<Thread>(threadCount);
+
+                        // add up to two threads, one for saving and one for progress, if necessary.
+                        var trackingThreads = new List<Thread>(progressThread != null ? 2 : 1);
+                        if (progressThread != null)
+                        {
+                            progressThread.Start();
+                            trackingThreads.Add(progressThread);
+                        }
+
+                        // break up the batch save into 100 even chunks. This is most important for very large directories
+                        var filesPerSave = (int)Math.Ceiling((double)metadata.FileCount / 100);
+                        //start a bunch of new threads that pull from the file list and then wait for them to finish
+                        int filesCompleted = 0;
+                        for (int i = 0; i < threadCount; i++)
+                        {
+                            var t = new Thread(() => {
+                                UploadMetadata file;
+                                while (allFiles.TryDequeue(out file))
+                                {
+                                    
+                                    try
+                                    {
+                                        _token.ThrowIfCancellationRequested();
+                                        // only initiate uploads for files that are not already complete
+                                        if (file.Status != SegmentUploadStatus.Complete)
+                                        {
+                                            var segmentProgressTracker = CreateSegmentProgressTracker(file, fileProgressTracker);
+                                            if (this.Parameters.IsDownload)
+                                            {
+                                                DownloadFile(file, segmentProgressTracker);
+                                            }
+                                            else
+                                            {
+                                                UploadFile(file, segmentProgressTracker);
+                                            }
+                                        }
+                                    }
+                                    catch (OperationCanceledException ex)
+                                    {
+                                        // Add to the queue and re-throw so that we immediately abort
+                                        exceptions.Enqueue(ex);
+
+                                        // on cancel definitely try to save the metadata
+                                        try
+                                        {
+                                            // replace the file in the list with the one that we have been modifying
+                                            foreach (var item in metadata.Files.Where(f => f.UploadId.Equals(file.UploadId)))
+                                            {
+                                                item.Status = file.Status;
+                                                item.Segments = file.Segments;
+                                            }
+
+                                            metadata.Save();
+                                        }
+                                        catch { } // if we can't save the metadata we shouldn't fail out. 
+                                        // break out of the loop since the operation is cancelled.
+                                        break;
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        // for all other exceptions just enqueue and continue.
+                                        exceptions.Enqueue(ex);
+                                        // in this case we should save since something bad happened, but only if we aren't going to save anyway in the finally.
+                                        if (filesCompleted % filesPerSave != 0)
+                                        {
+                                            try
+                                            {
+                                                // replace the file in the list with the one that we have been modifying
+
+                                                foreach (var item in metadata.Files.Where(f => f.UploadId.Equals(file.UploadId)))
+                                                {
+                                                    item.Status = file.Status;
+                                                    item.Segments = file.Segments;
+                                                }
+
+                                                metadata.Save();
+                                            }
+                                            catch { } // if we can't save the metadata we shouldn't fail out. 
+                                        }
+
+                                        // indicate we failed to tracking thread.
+                                        if(this.OnFileUploadThreadFailProgressUpdate != null)
+                                        {
+                                            this.OnFileUploadThreadFailProgressUpdate(file);
+                                        }
+                                    }
+                                    finally
+                                    {
+                                        // increment the files that we have made it through (even if they have failed).
+                                        // this ensures that we will periodically save the metadata
+                                        Interlocked.Increment(ref filesCompleted);
+                                        try
+                                        {
+                                            foreach (var item in metadata.Files.Where(f => f.UploadId.Equals(file.UploadId)))
+                                            {
+                                                item.Status = file.Status;
+                                                item.Segments = file.Segments;
+                                            }
+
+                                            // delete the temp metadata created if it exists.
+                                            file.DeleteFile();
+                                            file = null;
+                                        }
+                                        catch { } // if we can't delete a temp file we shouldn't fail out.
+                                    }
+                                }
+                            });
+                            t.Start();
+                            executionThreads.Add(t);
+                        }
+
+                        // create a thread that handles saving of the metadata so that there is no locking happening in the upload threads
+                        var saveThread = new Thread(() =>
+                        {
+                            while (allFiles.Count > 0)
                             {
                                 try
                                 {
                                     _token.ThrowIfCancellationRequested();
-                                    // only initiate uploads for files that are not already complete
-                                    if (file.Status != SegmentUploadStatus.Complete)
+                                    if (filesCompleted % filesPerSave == 0)
                                     {
-                                        var segmentProgressTracker = CreateSegmentProgressTracker(file, fileProgressTracker);
-                                        if (this.Parameters.IsDownload)
+                                        try
                                         {
-                                            DownloadFile(file, segmentProgressTracker);
+                                            metadata.Save();
                                         }
-                                        else
-                                        {
-                                            UploadFile(file, segmentProgressTracker);
-                                        }
+                                        catch { } // if we can't save the metadata we shouldn't fail out. 
                                     }
+
+                                    // sleep for two seconds between checks to save just to keep this thread from using too many cycles.
+                                    Thread.Sleep(2000);
                                 }
                                 catch (OperationCanceledException ex)
                                 {
-                                    // Add to the queue and re-throw so that we immediately abort
                                     exceptions.Enqueue(ex);
-                                    throw;
-                                }
-                                catch (Exception ex)
-                                {
-                                    // for all other exceptions just enqueue and continue.
-                                    exceptions.Enqueue(ex);
-                                }
-                                finally
-                                {
-                                    // attempt to save the metadata
                                     try
                                     {
                                         metadata.Save();
-                                        // delete the temp metadata created if it exists.
-                                        file.DeleteFile();
                                     }
-                                    catch { } // if we can't save the metadata or delete a temp file we shouldn't fail out.
+                                    catch { } // if we can't save the metadata we shouldn't fail out. 
+                                    // break out of the loop since we have cancelled.
+                                    break;
+                                }
+                                catch (Exception ex)
+                                {
+                                    exceptions.Enqueue(ex);
                                 }
                             }
-                        );
+                        });
 
-                        if(exceptions.Count > 0)
+                        saveThread.Start();
+                        trackingThreads.Add(saveThread);
+
+                        foreach (var t in executionThreads)
+                        {
+                            t.Join();
+                        }
+
+                        if (exceptions.Count > 0)
                         {
                             throw new AggregateException(exceptions);
                         }
 
                         metadata.DeleteFile();
+
+                        foreach(var t in trackingThreads)
+                        {
+                            if (t.ThreadState == ThreadState.Running)
+                            {
+                                // TODO: Log that the thread is still running when it should have finished
+                                t.Abort();
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // do not rethrow in this case.
+                        try
+                        {
+                            // if anything went wrong, make sure that we attempt to save the current state of the folder metadata
+                            metadata.Save();
+                        }
+                        catch { } // saving the metadata is a best effort, we will not fail out for this reason and we want to ensure the root exception is preserved.
+                    }
+                    catch (AggregateException ex)
+                    {
+                        try
+                        {
+                            // if anything went wrong, make sure that we attempt to save the current state of the folder metadata
+                            metadata.Save();
+                        }
+                        catch { } // saving the metadata is a best effort, we will not fail out for this reason and we want to ensure the root exception is preserved.
+
+                        if (!ex.InnerExceptions.OfType<OperationCanceledException>().Any())
+                        {
+                            throw;
+                        }
                     }
                     catch
                     {
@@ -228,6 +389,10 @@ namespace Microsoft.Azure.Management.DataLake.StoreUploader
                         throw;
                     }
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                // do not throw this higher, since we have cancelled out.
             }
             finally
             {
@@ -536,18 +701,45 @@ namespace Microsoft.Azure.Management.DataLake.StoreUploader
         {
             ValidateFolderMetadataMatchesLocalFile(metadata);
             var exceptions = new ConcurrentQueue<Exception>();
-            //see what files already exist - update metadata accordingly (only for segments that are missing from server; if it's on the server but not in metadata, reupload)
-            Parallel.For(0, metadata.Files.Length, i =>
+            var threadsToRun = new List<Thread>(metadata.Files.Length);
+            var files = new ConcurrentQueue<UploadMetadata>(metadata.Files);
+            int threadCount = Math.Min(metadata.Files.Length, 500);
+            for (int i =0; i < threadCount; i++)
             {
-                try
+                var t = new Thread(() =>
                 {
-                    metadata.Files[i] = ValidateMetadataForResume(metadata.Files[i], true);
-                }
-                catch(Exception e)
-                {
-                    exceptions.Enqueue(e);
-                }
-            });
+                    //see what files already exist - update metadata accordingly (only for segments that are missing from server; if it's on the server but not in metadata, reupload)
+                    UploadMetadata toValidate;
+                    while (files.TryDequeue(out toValidate))
+                    {
+                        _token.ThrowIfCancellationRequested();
+                        try
+                        {
+                            var toReplace = ValidateMetadataForResume(toValidate, true);
+                            for (int j = 0; j < metadata.Files.Length; j++)
+                            {
+                                if (metadata.Files[j].UploadId == toReplace.UploadId)
+                                {
+                                    metadata.Files[j] = toReplace;
+                                    break;
+                                }
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            exceptions.Enqueue(e);
+                        }
+                    }
+                });
+
+                t.Start();
+                threadsToRun.Add(t);
+            }
+
+            foreach(var t in threadsToRun)
+            {
+                t.Join();
+            }
 
             if(exceptions.Count > 0)
             {
@@ -565,14 +757,33 @@ namespace Microsoft.Azure.Management.DataLake.StoreUploader
         {
             ValidateFolderMetadataMatchesLocalFile(metadata);
             var exceptions = new ConcurrentQueue<Exception>();
-            Parallel.ForEach(metadata.Files, file =>
+            var threadsToRun = new List<Thread>(metadata.Files.Length);
+            var files = new ConcurrentQueue<UploadMetadata>(metadata.Files);
+            int threadCount = Math.Min(metadata.Files.Length, 500);
+            for (int i = 0; i < threadCount; i++)
             {
-                //verify that the target stream does not already exist (in case we don't want to overwrite)
-                if (!this.Parameters.IsOverwrite && _frontEnd.StreamExists(file.TargetStreamPath, this.Parameters.IsDownload))
+                var t = new Thread(() =>
                 {
-                    exceptions.Enqueue(new InvalidOperationException(string.Format("Stream at path: {0} already exists. Please set overwrite to true to overwrite streams that exist.", file.TargetStreamPath)));
-                }
-            });
+                    UploadMetadata toValidate;
+                    while (files.TryDequeue(out toValidate))
+                    {
+                        _token.ThrowIfCancellationRequested();
+                        //verify that the target stream does not already exist (in case we don't want to overwrite)
+                        if (!this.Parameters.IsOverwrite && _frontEnd.StreamExists(toValidate.TargetStreamPath, this.Parameters.IsDownload))
+                        {
+                            exceptions.Enqueue(new InvalidOperationException(string.Format("Stream at path: {0} already exists. Please set overwrite to true to overwrite streams that exist.", toValidate.TargetStreamPath)));
+                        }
+                    }
+                });
+
+                t.Start();
+                threadsToRun.Add(t);
+            }
+
+            foreach(var t in threadsToRun)
+            {
+                t.Join();
+            }
 
             if(exceptions.Count > 0)
             {
@@ -628,25 +839,44 @@ namespace Microsoft.Azure.Management.DataLake.StoreUploader
             }
 
             var exceptions = new ConcurrentQueue<Exception>();
-            Parallel.ForEach(metadata.Files, file =>
+            var threadsToRun = new List<Thread>(metadata.Files.Length);
+            var files = new ConcurrentQueue<UploadMetadata>(metadata.Files);
+            int threadCount = Math.Min(metadata.Files.Length, 500);
+            for (int i = 0; i < threadCount; i++)
             {
-                try
+                var t = new Thread(() =>
                 {
-                    ValidateMetadataMatchesLocalFile(file, true);
-                    if(this.Parameters.IsDownload)
+                    UploadMetadata toValidate;
+                    while (files.TryDequeue(out toValidate))
                     {
-                        // validate the file exists and the size is correct
-                        if(!fileAndSizePairs.ContainsKey(file.InputFilePath) || fileAndSizePairs[file.InputFilePath] != file.FileLength)
+                        _token.ThrowIfCancellationRequested();
+                        try
                         {
-                            throw new InvalidOperationException("The metadata refers to a file that does not exist or the file size does not match");
+                            ValidateMetadataMatchesLocalFile(toValidate, true);
+                            if (this.Parameters.IsDownload)
+                            {
+                                // validate the file exists and the size is correct
+                                if (!fileAndSizePairs.ContainsKey(toValidate.InputFilePath) || fileAndSizePairs[toValidate.InputFilePath] != toValidate.FileLength)
+                                {
+                                    throw new InvalidOperationException("The metadata refers to a file that does not exist or the file size does not match");
+                                }
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            exceptions.Enqueue(e);
                         }
                     }
-                }
-                catch (Exception e)
-                {
-                    exceptions.Enqueue(e);
-                }
-            });
+                });
+
+                t.Start();
+                threadsToRun.Add(t);
+            }
+
+            foreach (var t in threadsToRun)
+            {
+                t.Join();
+            }
 
             if(exceptions.Count > 0)
             {
@@ -711,6 +941,11 @@ namespace Microsoft.Azure.Management.DataLake.StoreUploader
         /// <param name="metadata"></param>
         private void DownloadFile(UploadMetadata metadata, IProgress<SegmentUploadProgress> segmentProgressTracker = null)
         {
+            if (!_frontEnd.StreamExists(metadata.InputFilePath))
+            {
+                throw new FileNotFoundException("Unable to locate remote file", metadata.InputFilePath);
+            }
+
             try
             {
                 segmentProgressTracker = segmentProgressTracker ?? CreateSegmentProgressTracker(metadata);
@@ -725,6 +960,11 @@ namespace Microsoft.Azure.Management.DataLake.StoreUploader
                     //perform the multi-segment upload
                     // reducing the thread count to make it equal to the segment count
                     // if it is larger, since those extra threads will not be used.
+                    using (var targetStream = new FileStream(metadata.TargetStreamPath + ".inprogress", FileMode.Create, FileAccess.Write, FileShare.ReadWrite))
+                    {
+                        targetStream.SetLength(metadata.FileLength);
+                    }
+
                     var msu = new MultipleSegmentDownloader(metadata,
                         metadata.SegmentCount < this.Parameters.PerFileThreadCount ?
                         metadata.SegmentCount :
@@ -736,14 +976,22 @@ namespace Microsoft.Azure.Management.DataLake.StoreUploader
 
                     //concatenate the files at the end
                     ConcatenateSegments(metadata);
+                    
                 }
                 else
                 {
                     //optimization if we only have one segment: upload it directly to the target stream
+
+                    using (var targetStream = new FileStream(metadata.TargetStreamPath, FileMode.Create, FileAccess.Write))
+                    {
+                        targetStream.SetLength(metadata.FileLength);
+                    }
+
                     metadata.Segments[0].Path = metadata.TargetStreamPath;
                     var ssu = new SingleSegmentDownloader(0, metadata, _frontEnd, _token, segmentProgressTracker);
                     ssu.UseBackOffRetryStrategy = this.Parameters.UseSegmentBlockBackOffRetryStrategy;
                     ssu.Download();
+                    ssu.VerifyDownloadedStream();
                 }
                 metadata.Status = SegmentUploadStatus.Complete;
 
@@ -791,14 +1039,19 @@ namespace Microsoft.Azure.Management.DataLake.StoreUploader
         /// </summary>
         /// <param name="metadata">The metadata.</param>
         /// <returns></returns>
-        private IProgress<UploadProgress> CreateFileProgressTracker(UploadFolderMetadata metadata)
+        private IProgress<UploadProgress> CreateFileProgressTracker(UploadFolderMetadata metadata, out Thread toStart)
         {
+            toStart = null;
             if (_folderProgressTracker == null)
             {
                 return null;
             }
 
             var overallProgress = new UploadFolderProgress(metadata);
+
+            // register an event to ensure that, no matter what, we account for all file uploads.
+            this.OnFileUploadThreadFailProgressUpdate += overallProgress.OnFileUploadThreadAborted;
+            toStart = overallProgress.GetProgressTrackingThread(_token);
             return new Progress<UploadProgress>(
                 (sup) =>
                 {
@@ -806,7 +1059,6 @@ namespace Microsoft.Azure.Management.DataLake.StoreUploader
                     overallProgress.SetSegmentProgress(sup);
                     _folderProgressTracker.Report(overallProgress);
                 });
-
         }
 
         /// <summary>
@@ -815,7 +1067,7 @@ namespace Microsoft.Azure.Management.DataLake.StoreUploader
         /// <param name="metadata"></param>
         private void ConcatenateSegments(UploadMetadata metadata)
         {
-            string[] inputPaths = new string[metadata.SegmentCount];
+            string[] inputPaths = new string[this.Parameters.IsDownload ? 2 : metadata.SegmentCount];
             
             //verify if target stream exists
             if (_frontEnd.StreamExists(metadata.TargetStreamPath, this.Parameters.IsDownload))
@@ -830,14 +1082,58 @@ namespace Microsoft.Azure.Management.DataLake.StoreUploader
                 }
             }
 
-            //ensure all input streams exist and are of the expected length
-            //ensure all segments in the metadata are marked as 'complete'
             var exceptions = new ConcurrentQueue<Exception>();
-            Parallel.For(
-                0,
-                metadata.SegmentCount,
-                new ParallelOptions() { MaxDegreeOfParallelism = this.Parameters.PerFileThreadCount },
-                (i) =>
+            if (this.Parameters.IsDownload)
+            {
+                // call concatenate, which really just renames
+                // the "inprogress" file to complete.
+                inputPaths[0] = string.Format("{0}.inprogress", metadata.TargetStreamPath);
+                inputPaths[1] = metadata.TargetStreamPath;
+
+                // validate that the file is the right length.
+                var retryCount = 0;
+                long remoteLength = -1;
+                try
+                {
+                    while (retryCount < SingleSegmentUploader.MaxBufferUploadAttemptCount)
+                    {
+                        _token.ThrowIfCancellationRequested();
+                        retryCount++;
+                        try
+                        {
+                            remoteLength = _frontEnd.GetStreamLength(inputPaths[0], this.Parameters.IsDownload);
+                            break;
+                        }
+                        catch (Exception e)
+                        {
+                            _token.ThrowIfCancellationRequested();
+                            if (retryCount >= SingleSegmentUploader.MaxBufferUploadAttemptCount)
+                            {
+                                throw new UploadFailedException(
+                                    string.Format(
+                                        "Cannot perform 'Finalization' operation due to the following exception retrieving file information: {0}",
+                                        e));
+                            }
+
+                            SingleSegmentUploader.WaitForRetry(retryCount, Parameters.UseSegmentBlockBackOffRetryStrategy, _token);
+                        }
+                    }
+
+                    if (remoteLength != metadata.FileLength)
+                    {
+                        throw new UploadFailedException(string.Format("Cannot perform 'Finalization' operation because in progress file {0} has an incorrect length (expected {1}, actual {2}).", inputPaths[0], metadata.FileLength, remoteLength));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    exceptions.Enqueue(ex);
+                }
+            }
+            else
+            {
+                //ensure all segments in the metadata are marked as 'complete'
+                
+                for (int i = 0; i < metadata.SegmentCount; i++)
                 {
                     try
                     {
@@ -846,48 +1142,15 @@ namespace Microsoft.Azure.Management.DataLake.StoreUploader
                             throw new UploadFailedException("Cannot perform 'Concatenate' operation because not all streams are fully uploaded.");
                         }
 
-                        var remoteStreamPath = metadata.Segments[i].Path;
-                        var retryCount = 0;
-                        long remoteLength = -1;
-                        
-                        while (retryCount < SingleSegmentUploader.MaxBufferUploadAttemptCount)
-                        {
-                            _token.ThrowIfCancellationRequested();
-                            retryCount++;
-                            try
-                            {
-                                remoteLength = _frontEnd.GetStreamLength(remoteStreamPath, this.Parameters.IsDownload);
-                                break;
-                            }
-                            catch (Exception e)
-                            {
-                                _token.ThrowIfCancellationRequested();
-                                if (retryCount >= SingleSegmentUploader.MaxBufferUploadAttemptCount)
-                                {
-                                    throw new UploadFailedException(
-                                        string.Format(
-                                            "Cannot perform 'Concatenate' operation due to the following exception retrieving file information: {0}",
-                                            e));
-                                }
-
-                                SingleSegmentUploader.WaitForRetry(retryCount, Parameters.UseSegmentBlockBackOffRetryStrategy, _token);
-                            }
-                        }
-
-                        
-                        if (remoteLength != metadata.Segments[i].Length)
-                        {
-                            throw new UploadFailedException(string.Format("Cannot perform 'Concatenate' operation because segment {0} has an incorrect length (expected {1}, actual {2}).", i, metadata.Segments[i].Length, remoteLength));
-                        }
-
-                        inputPaths[i] = remoteStreamPath;
+                        inputPaths[i] = metadata.Segments[i].Path;
                     }
                     catch (Exception ex)
                     {
                         //collect any exceptions, whether we just generated them above or whether they come from the Front End,
                         exceptions.Enqueue(ex);
                     }
-                });
+                }
+            }
 
             if (exceptions.Count > 0)
             {
